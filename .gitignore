@@ -3,7 +3,7 @@
 .vscode-test-web/
 node_modules/
 dist/
-
+/fastapply/target
 # created by simulation
 .simulation
 
