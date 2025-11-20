@@ -4,7 +4,10 @@
  *--------------------------------------------------------------------------------------------*/
 
 import type { Attachment, Session } from '@github/copilot/sdk';
-import type * as vscode from 'vscode';
+
+// eslint-disable-next-line local/no-runtime-import
+import * as vscode from 'vscode';
+
 import { IGitService } from '../../../../platform/git/common/gitService';
 import { ILogService } from '../../../../platform/log/common/logService';
 import { IWorkspaceService } from '../../../../platform/workspace/common/workspaceService';
@@ -19,7 +22,11 @@ import { ChatRequestTurn2, ChatResponseThinkingProgressPart, ChatResponseTurn2, 
 import { ExternalEditTracker } from '../../common/externalEditTracker';
 import { buildChatHistoryFromEvents, getAffectedUrisForEditTool, isCopilotCliEditToolCall, processToolExecutionComplete, processToolExecutionStart, ToolCall, UnknownToolCall } from '../common/copilotCLITools';
 import { CopilotCLISessionOptions, ICopilotCLISDK } from './copilotCli';
+
 import { PermissionRequest, requiresFileEditconfirmation } from './permissionHelpers';
+
+// eslint-disable-next-line import/no-restricted-paths
+import { FastApplyBridge } from '../../../fastapply/vscode/bridge';
 
 type PermissionHandler = (
 	permissionRequest: PermissionRequest,
@@ -130,7 +137,6 @@ export class CopilotCLISession extends DisposableStore implements ICopilotCLISes
 		const editTracker = new ExternalEditTracker();
 		const editFilesAndToolCallIds = new ResourceMap<ToolCall[]>();
 		disposables.add(this._options.addPermissionHandler(async (permissionRequest) => {
-			// Need better API from SDK to correlate file edits in permission requests to tool invocations.
 			return await this.requestPermission(permissionRequest, editTracker,
 				(file: Uri) => {
 					const ids = editFilesAndToolCallIds.get(file);
@@ -142,7 +148,6 @@ export class CopilotCLISession extends DisposableStore implements ICopilotCLISes
 		}));
 
 		try {
-			// Where possible try to avoid an extra call to getSelectedModel by using cached value.
 			const [currentModel, authInfo] = await Promise.all([
 				modelId ? (this._lastUsedModel ?? raceCancellation(this._sdkSession.getSelectedModel(), token)) : undefined,
 				raceCancellation(this.copilotCLISDK.getAuthInfo(), token)
@@ -165,7 +170,6 @@ export class CopilotCLISession extends DisposableStore implements ICopilotCLISes
 				toolNames.set(event.data.toolCallId, event.data.toolName);
 				if (isCopilotCliEditToolCall(event.data)) {
 					editToolIds.add(event.data.toolCallId);
-					// Track edits for edit tools.
 					const editUris = getAffectedUrisForEditTool(event.data);
 					if (editUris.length) {
 						editUris.forEach(uri => {
@@ -185,7 +189,6 @@ export class CopilotCLISession extends DisposableStore implements ICopilotCLISes
 				this.logService.trace(`[CopilotCLISession] Start Tool ${event.data.toolName || '<unknown>'}`);
 			})));
 			disposables.add(toDisposable(this._sdkSession.on('tool.execution_complete', (event) => {
-				// Mark the end of the edit if this was an edit tool.
 				editTracker.completeEdit(event.data.toolCallId);
 				if (editToolIds.has(event.data.toolCallId)) {
 					this.logService.trace(`[CopilotCLISession] Completed edit tracking for toolCallId ${event.data.toolCallId}`);
@@ -210,13 +213,37 @@ export class CopilotCLISession extends DisposableStore implements ICopilotCLISes
 			})));
 
 			if (!token.isCancellationRequested) {
+
+				// ============================================================
+				// [FAST APPLY INJECTION START]
+				// ============================================================
+				const editor = vscode.window.activeTextEditor;
+				if (editor) {
+					try {
+						const rustCtx = await FastApplyBridge.findComponent(editor.document, prompt);
+						if (rustCtx && rustCtx.found) {
+							this.logService.trace(`[FastApply] Found component at lines ${rustCtx.start_line}-${rustCtx.end_line}`);
+
+							// Highlight it
+							await FastApplyBridge.selectContext(editor, rustCtx);
+
+							// Inject it into the prompt
+							const specificCode = editor.document.getText(new vscode.Range(rustCtx.start_line, 0, rustCtx.end_line, 0));
+							prompt = `FOCUSED CONTEXT (Only change this part):\n\`\`\`typescript\n${specificCode}\n\`\`\`\n\nUSER REQUEST: ${prompt}`;
+						}
+					} catch (err) {
+						this.logService.error("[FastApply] Bridge Error: " + err);
+					}
+				}
+				// ============================================================
+				// [FAST APPLY INJECTION END]
+				// ============================================================
+
 				await this._sdkSession.send({ prompt, attachments, abortController });
 			}
 			this.logService.trace(`[CopilotCLISession] Invoking session (completed) ${this.sessionId}`);
 
 			if (this._options.isolationEnabled && !token.isCancellationRequested) {
-				// When isolation is enabled and we are using a git workspace, stage
-				// all changes in the working directory when the session is completed
 				const workingDirectory = this._options.toSessionOptions().workingDirectory;
 				if (workingDirectory) {
 					await this.gitService.add(Uri.file(workingDirectory), []);
@@ -264,18 +291,11 @@ export class CopilotCLISession extends DisposableStore implements ICopilotCLISes
 		token: vscode.CancellationToken
 	): Promise<{ kind: 'approved' } | { kind: 'denied-interactively-by-user' }> {
 		if (permissionRequest.kind === 'read') {
-			// If user is reading a file in the working directory or workspace, auto-approve
-			// read requests. Outside workspace reads (e.g., /etc/passwd) will still require
-			// approval.
 			const data = Uri.file(permissionRequest.path);
-
 			if (workingDirectory && extUriBiasedIgnorePathCase.isEqualOrParent(data, Uri.file(workingDirectory))) {
-				this.logService.trace(`[CopilotCLISession] Auto Approving request to read file in working directory ${permissionRequest.path}`);
 				return { kind: 'approved' };
 			}
-
 			if (this.workspaceService.getWorkspaceFolder(data)) {
-				this.logService.trace(`[CopilotCLISession] Auto Approving request to read workspace file ${permissionRequest.path}`);
 				return { kind: 'approved' };
 			}
 		}
@@ -283,32 +303,21 @@ export class CopilotCLISession extends DisposableStore implements ICopilotCLISes
 		const editFile = permissionRequest.kind === 'write' ? Uri.file(permissionRequest.fileName) : undefined;
 		const toolCall = editFile ? getEditKeyForFile(editFile) : undefined;
 		if (workingDirectory && permissionRequest.kind === 'write' && editFile) {
-			// TODO:@rebornix @lszomoru
-			// If user is writing a file in the working directory configured for the session, AND the working directory is not a workspace folder,
-			// auto-approve the write request. Currently we only set non-workspace working directories when using git worktrees.
-
 			const isWorkspaceFile = this.workspaceService.getWorkspaceFolder(editFile);
 			const isWorkingDirectoryFile = !this.workspaceService.getWorkspaceFolder(Uri.file(workingDirectory)) && extUriBiasedIgnorePathCase.isEqualOrParent(editFile, Uri.file(workingDirectory));
 
 			let autoApprove = false;
-			// If isolation is enabled, we only auto-approve writes within the working directory.
 			if (this._options.isolationEnabled && isWorkingDirectoryFile) {
 				autoApprove = true;
 			}
-			// If its a workspace file, and not editing protected files, we auto-approve.
 			if (!autoApprove && isWorkspaceFile && !(await requiresFileEditconfirmation(this.instantiationService, permissionRequest))) {
 				autoApprove = true;
 			}
 
 			if (autoApprove) {
-				this.logService.trace(`[CopilotCLISession] Auto Approving request ${permissionRequest.fileName}`);
-
-				// If we're editing a file, start tracking the edit & wait for core to acknowledge it.
 				if (toolCall && this._stream) {
-					this.logService.trace(`[CopilotCLISession] Starting to track edit for toolCallId ${toolCall.toolCallId} & file ${editFile.fsPath}`);
 					await editTracker.trackEdit(toolCall.toolCallId, [editFile], this._stream);
 				}
-
 				return { kind: 'approved' };
 			}
 		}
@@ -316,14 +325,11 @@ export class CopilotCLISession extends DisposableStore implements ICopilotCLISes
 		try {
 			const permissionHandler = await this.waitForPermissionHandler(permissionRequest);
 			if (!permissionHandler) {
-				this.logService.warn(`[CopilotCLISession] No permission handler registered, denying request for ${permissionRequest.kind} permission.`);
 				return { kind: 'denied-interactively-by-user' };
 			}
 
 			if (await permissionHandler(permissionRequest, toolCall, token)) {
-				// If we're editing a file, start tracking the edit & wait for core to acknowledge it.
 				if (editFile && toolCall && this._stream) {
-					this.logService.trace(`[CopilotCLISession] Starting to track edit for toolCallId ${toolCall.toolCallId} & file ${editFile.fsPath}`);
 					await editTracker.trackEdit(toolCall.toolCallId, [editFile], this._stream);
 				}
 				return { kind: 'approved' };
